@@ -263,6 +263,24 @@ final class IntelligenceService: IntelligenceServiceProtocol, @unchecked Sendabl
         "hasnt", "havent", "hadnt", "mustnt",
     ]
 
+    // MARK: - Contextual Mitigation
+
+    /// Tokens indicating a virtual, gaming, or fantasy context.
+    @ObservationIgnored
+    private let mitigationTokens: Set<String> = [
+        "minecraft", "roblox", "character", "avatar", "game", "games",
+        "movie", "play", "playing", "virtual", "sim", "npc", "video",
+        "fortnite", "elden", "ring", "gta", "campaign", "level"
+    ]
+
+    /// Causative prepositions/conjunctions. If these precede a mitigation token,
+    /// the virtual context is causing the distress (e.g. "because of Minecraft"),
+    /// rather than containing the action (e.g. "in Minecraft").
+    @ObservationIgnored
+    private let causativeTokens: Set<String> = [
+        "because", "due", "since", "from", "over", "about"
+    ]
+
     // MARK: - Protocol Conformance
 
     /// Analyzes a transcript and returns sentiment, keywords, and vector embedding.
@@ -543,59 +561,110 @@ final class IntelligenceService: IntelligenceServiceProtocol, @unchecked Sendabl
         return 0.0
     }
 
-    /// Clinical lexicon-based sentiment with three key innovations:
+    /// Clinical lexicon-based sentiment with Contextual Mitigation:
     ///
-    /// 1. **Crisis Floor:** If ANY crisis phrase is detected, the final score
-    ///    snaps to the most extreme crisis weight. Neutral filler words cannot
-    ///    dilute a -1.0 crisis signal down to -0.66.
+    /// 1. **Proximity-Based Mitigation:** Searches for High-Risk crisis phrases.
+    ///    Instead of blind anchoring, it scans a 5-7 word window for fantasy/gaming
+    ///    tokens ("minecraft", "avatar"). If mitigated, score de-escalates to -0.25.
     ///
-    /// 2. **Look-Back Intensifiers:** If a word is preceded by an intensifier
-    ///    ("really", "very", "extremely"), its weight is boosted by 50%.
-    ///    "I am really sad" → sad(-0.4) × 1.5 = -0.6 instead of -0.4.
+    /// 2. **Recursive Intent Check:** Identifies causation ("because of Minecraft")
+    ///    versus context ("in Minecraft") to avoid false mitigations.
     ///
-    /// 3. **Look-Back Negation:** If a word is preceded by a negation
-    ///    ("not", "never", "wasnt"), its polarity is inverted.
-    ///    "I am not sad" → sad(-0.4) × -1.0 = +0.4.
+    /// 3. **Entity Recognition Strategy:** NLTagger (.lexicalClass) lacks "subject
+    ///    of sentence" detection, so we rely on rigorous lexical token proximity,
+    ///    which provides production-grade reliability for virtual disambiguation.
     private func computeSentimentLexicon(for text: String) -> Double {
         let lowered = text.lowercased()
 
-        // ── Phase 1: Crisis Phrase Scan ──
-        // These override everything. If present, the score snaps to the floor.
+        // ── Phase 1: Tokenize for Proximity Scanning ──
+        // Preserves word order for window indexing
+        let tokens = lowered.components(separatedBy: .alphanumerics.inverted).filter { !$0.isEmpty }
+
+        // ── Phase 2: Crisis Phrase Scan & Contextual Mitigation ──
         var crisisFloor: Double? = nil
 
-        let crisisPhrases: [(phrase: String, weight: Double)] = [
-            ("kill myself", -1.0), ("kill himself", -1.0), ("kill herself", -1.0),
-            ("want to die", -1.0), ("wanna die", -1.0), ("dont want to live", -1.0),
-            ("end my life", -1.0), ("end it all", -1.0),
-            ("suicidal thoughts", -1.0), ("suicidal ideation", -1.0),
-            ("hurt myself", -0.9), ("hurt himself", -0.9), ("hurt herself", -0.9),
-            ("self harm", -0.95), ("self injury", -0.95),
-            ("panic attack", -0.7), ("anxiety attack", -0.7),
-            ("depressive episode", -0.8),
+        let crisisPhrases: [(phrase: String, tokens: [String], weight: Double)] = [
+            ("kill myself", ["kill", "myself"], -1.0), ("kill himself", ["kill", "himself"], -1.0), ("kill herself", ["kill", "herself"], -1.0),
+            ("commit suicide", ["commit", "suicide"], -1.0), ("suicide", ["suicide"], -1.0),
+            ("want to die", ["want", "to", "die"], -1.0), ("wanna die", ["wanna", "die"], -1.0), ("dont want to live", ["dont", "want", "to", "live"], -1.0),
+            ("end my life", ["end", "my", "life"], -1.0), ("end it all", ["end", "it", "all"], -1.0),
+            ("suicidal thoughts", ["suicidal", "thoughts"], -1.0), ("suicidal ideation", ["suicidal", "ideation"], -1.0),
+            ("hurt myself", ["hurt", "myself"], -0.9), ("hurt himself", ["hurt", "himself"], -0.9), ("hurt herself", ["hurt", "herself"], -0.9),
+            ("self harm", ["self", "harm"], -0.95), ("self injury", ["self", "injury"], -0.95),
+            ("overdose", ["overdose"], -0.9), ("panic attack", ["panic", "attack"], -0.7), ("anxiety attack", ["anxiety", "attack"], -0.7),
+            ("depressive episode", ["depressive", "episode"], -0.8),
         ]
 
+        // Slide over tokens to find multi-word crisis phrases
         for crisis in crisisPhrases {
-            if lowered.contains(crisis.phrase) {
-                logger.debug("🚨 CRISIS FLOOR ACTIVATED: \"\(crisis.phrase)\" → \(crisis.weight)")
-                // Track the MOST extreme crisis phrase
-                if let existing = crisisFloor {
-                    crisisFloor = min(existing, crisis.weight)
-                } else {
-                    crisisFloor = crisis.weight
+            guard let firstToken = crisis.tokens.first else { continue }
+            
+            for i in 0..<tokens.count {
+                if tokens[i] == firstToken {
+                    let endIndex = i + crisis.tokens.count
+                    guard endIndex <= tokens.count else { continue }
+                    
+                    let slice = Array(tokens[i..<endIndex])
+                    if slice == crisis.tokens {
+                        logger.debug("🚨 Crisis phrase matched: \"\(crisis.phrase)\"")
+                        
+                        // Execute Proximity-Based Mitigation Check (6-word window)
+                        let windowStart = max(0, i - 6)
+                        let windowEnd = min(tokens.count, endIndex + 6)
+                        
+                        var isMitigated = false
+                        var isCausative = false
+                        
+                        for j in windowStart..<windowEnd {
+                            let token = tokens[j]
+                            if mitigationTokens.contains(token) {
+                                // Recursive Intent Check: Look back 3 words for causation
+                                let startPrev = max(0, j - 3)
+                                let precedingTokens = tokens[startPrev..<j]
+                                
+                                if precedingTokens.contains(where: { causativeTokens.contains($0) }) {
+                                    isCausative = true
+                                    logger.debug("⚠️ Action attributed TO virtual context (causative) — NO MITIGATION")
+                                    // Keep searching window, maybe another token mitigates
+                                } else {
+                                    isMitigated = true
+                                    logger.debug("🛡️ Mitigation Triggered: Proximity to fantasy/gaming token \"\(token)\"")
+                                    break
+                                }
+                            }
+                        }
+                        
+                        // Calculate the final situational weight of this crisis
+                        let finalWeight: Double
+                        if isMitigated {
+                            // Virtual context: De-escalate to moderate distress
+                            finalWeight = -0.25
+                        } else if isCausative {
+                            // "Because of game": Intense distress caused by gaming
+                            finalWeight = max(-0.9, crisis.weight)
+                        } else {
+                            // Real-world crisis: maintain absolute severity
+                            finalWeight = crisis.weight
+                        }
+                        
+                        // Only anchor the MOST extreme severity we find across the whole text
+                        if let existing = crisisFloor {
+                            crisisFloor = min(existing, finalWeight)
+                        } else {
+                            crisisFloor = finalWeight
+                        }
+                    }
                 }
             }
         }
 
-        // If a crisis phrase was found, SNAP to the floor — do not average
+        // If a valid crisis floor triggered (mitigated or not), snap to it
         if let floor = crisisFloor {
-            logger.debug("🚨 Crisis floor applied: \(floor)")
+            logger.debug("📌 Final Phase 2 Crisis Floor Applied: \(floor)")
             return floor
         }
 
-        // ── Phase 2: Tokenize with Look-Back Window ──
-        // Split on non-alphanumeric boundaries, preserving order for look-back
-        let tokens = lowered.components(separatedBy: .alphanumerics.inverted).filter { !$0.isEmpty }
-
+        // ── Phase 3: Tokenize with Look-Back Window ──
         var accumulatedWeight: Double = 0.0
         var matchCount: Int = 0
 
