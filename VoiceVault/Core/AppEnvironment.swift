@@ -78,6 +78,18 @@ final class AppEnvironment {
     /// In previews/tests: `MockStorageService` (in-memory array).
     let storageService: StorageServiceProtocol
 
+    /// The on-device empathetic response engine.
+    ///
+    /// In production: `EmpathyService` (Apple Foundation Models, Neural Engine).
+    /// In previews/tests: `MockEmpathyService` (canned deterministic responses).
+    let empathyService: EmpathyServiceProtocol
+
+    /// The deterministic provider intake intelligence engine.
+    ///
+    /// In production: `IntakeService` (statistical aggregation over StorageService).
+    /// In previews/tests: `MockIntakeService` (realistic sample data).
+    let intakeService: IntakeServiceProtocol
+
     // MARK: - Logger
 
     /// Shared logger for application-wide diagnostics.
@@ -95,16 +107,22 @@ final class AppEnvironment {
     ///   - audioService: The audio/transcription service to use.
     ///   - intelligenceService: The NLP intelligence service to use.
     ///   - storageService: The persistence service to use.
+    ///   - empathyService: The empathetic response service to use.
+    ///   - intakeService: The provider intake service to use.
     ///   - logger: The application logger. Defaults to the VoiceVault subsystem.
     init(
         audioService: AudioTranscriptionServiceProtocol,
         intelligenceService: IntelligenceServiceProtocol,
         storageService: StorageServiceProtocol,
+        empathyService: EmpathyServiceProtocol,
+        intakeService: IntakeServiceProtocol,
         logger: Logger = Logger(subsystem: "com.voicevault.app", category: "general")
     ) {
         self.audioService = audioService
         self.intelligenceService = intelligenceService
         self.storageService = storageService
+        self.empathyService = empathyService
+        self.intakeService = intakeService
         self.logger = logger
     }
 }
@@ -127,10 +145,14 @@ extension AppEnvironment {
         let logger = Logger(subsystem: "com.voicevault.app", category: "production")
         logger.info("🔧 Initializing VoiceVault production environment — all services LIVE")
 
+        let storage = StorageService(modelContext: modelContainer.mainContext)
+
         return AppEnvironment(
             audioService: AudioTranscriptionService(),
             intelligenceService: IntelligenceService(),
-            storageService: StorageService(modelContext: modelContainer.mainContext),
+            storageService: storage,
+            empathyService: EmpathyService(),
+            intakeService: IntakeService(storageService: storage),
             logger: logger
         )
     }
@@ -147,6 +169,8 @@ extension AppEnvironment {
             audioService: MockAudioTranscriptionService(),
             intelligenceService: MockIntelligenceService(),
             storageService: MockStorageService.withSampleData(),
+            empathyService: MockEmpathyService(),
+            intakeService: MockIntakeService(),
             logger: Logger(subsystem: "com.voicevault.app", category: "preview")
         )
     }

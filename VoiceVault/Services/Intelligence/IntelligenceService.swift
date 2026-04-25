@@ -94,8 +94,8 @@ final class IntelligenceService: IntelligenceServiceProtocol, @unchecked Sendabl
         "and", "but", "or", "nor", "so", "yet",
         // Adverbs that leak through
         // NOTE: "very", "really", "extremely" etc. are intentionally EXCLUDED.
-        // They are used as intensifiers in the sentiment look-back window.
-        "not", "no", "just", "also", "too",
+        // "not", "no", and "never" explicitly preserved for sentiment math
+        "just", "also", "too",
         "now", "then", "here", "there", "when", "where", "how",
         "all", "each", "every", "both", "few", "more", "most",
         "other", "some", "such", "only", "own", "same",
@@ -131,10 +131,16 @@ final class IntelligenceService: IntelligenceServiceProtocol, @unchecked Sendabl
         // Crisis / self-harm (HIGHEST priority)
         "kill myself", "kill herself", "kill himself",
         "hurt myself", "hurt herself", "hurt himself",
+        "commit suicide",
         "end my life", "end it all",
         "suicidal thoughts", "suicidal ideation",
         "self harm", "self injury",
         "want to die", "wanna die", "dont want to live",
+        
+        // Passive & Metaphorical Ideation
+        "say goodbye", "not see tomorrow", "end of the road", "tell them i said goodbye", "said goodbye",
+        "drowning", "suffocating", "underwater", "cant breathe",
+        "hit by a truck", "not wake up", "stop existing",
 
         // Psychiatric conditions
         "panic attack", "anxiety attack",
@@ -279,6 +285,18 @@ final class IntelligenceService: IntelligenceServiceProtocol, @unchecked Sendabl
     @ObservationIgnored
     private let causativeTokens: Set<String> = [
         "because", "due", "since", "from", "over", "about"
+    ]
+
+    /// Tokens establishing a protective context that neutralizes crisis flags.
+    @ObservationIgnored
+    private let protectiveTokens: Set<String> = [
+        "prevention", "awareness", "hotline", "survivor", "advocate", "counselor", "club"
+    ]
+
+    /// Familial tokens that trigger the 1.2x interpersonal multiplier.
+    @ObservationIgnored
+    private let familialTokens: Set<String> = [
+        "mom", "mother", "dad", "father", "parents"
     ]
 
     // MARK: - Protocol Conformance
@@ -576,12 +594,11 @@ final class IntelligenceService: IntelligenceServiceProtocol, @unchecked Sendabl
     private func computeSentimentLexicon(for text: String) -> Double {
         let lowered = text.lowercased()
 
-        // ── Phase 1: Tokenize for Proximity Scanning ──
-        // Preserves word order for window indexing
-        let tokens = lowered.components(separatedBy: .alphanumerics.inverted).filter { !$0.isEmpty }
-
-        // ── Phase 2: Crisis Phrase Scan & Contextual Mitigation ──
-        var crisisFloor: Double? = nil
+        // ── Phase 1: Contextual Mitigation & Ideation Scanner (Highest Precedence) ──
+        
+        // The token array without punctuation is only used for the proximity scanner.
+        let rawTokens = lowered.components(separatedBy: .alphanumerics.inverted).filter { !$0.isEmpty }
+        var globalCrisisFloor: Double? = nil
 
         let crisisPhrases: [(phrase: String, tokens: [String], weight: Double)] = [
             ("kill myself", ["kill", "myself"], -1.0), ("kill himself", ["kill", "himself"], -1.0), ("kill herself", ["kill", "herself"], -1.0),
@@ -593,117 +610,178 @@ final class IntelligenceService: IntelligenceServiceProtocol, @unchecked Sendabl
             ("self harm", ["self", "harm"], -0.95), ("self injury", ["self", "injury"], -0.95),
             ("overdose", ["overdose"], -0.9), ("panic attack", ["panic", "attack"], -0.7), ("anxiety attack", ["anxiety", "attack"], -0.7),
             ("depressive episode", ["depressive", "episode"], -0.8),
+            // Passive & Metaphorical Ideation
+            ("say goodbye", ["say", "goodbye"], -0.9), ("said goodbye", ["said", "goodbye"], -0.95),
+            ("not see tomorrow", ["not", "see", "tomorrow"], -0.95), ("end of the road", ["end", "of", "the", "road"], -0.85),
+            ("tell them i said goodbye", ["tell", "them", "i", "said", "goodbye"], -1.0),
+            ("drowning", ["drowning"], -0.85), ("suffocating", ["suffocating"], -0.85), ("underwater", ["underwater"], -0.85),
+            ("cant breathe", ["cant", "breathe"], -0.85),
+            ("hit by a truck", ["hit", "by", "a", "truck"], -0.95), ("not wake up", ["not", "wake", "up"], -0.95), 
+            ("stop existing", ["stop", "existing"], -0.95)
         ]
 
         // Slide over tokens to find multi-word crisis phrases
         for crisis in crisisPhrases {
             guard let firstToken = crisis.tokens.first else { continue }
             
-            for i in 0..<tokens.count {
-                if tokens[i] == firstToken {
+            for i in 0..<rawTokens.count {
+                if rawTokens[i] == firstToken {
                     let endIndex = i + crisis.tokens.count
-                    guard endIndex <= tokens.count else { continue }
+                    guard endIndex <= rawTokens.count else { continue }
                     
-                    let slice = Array(tokens[i..<endIndex])
+                    let slice = Array(rawTokens[i..<endIndex])
                     if slice == crisis.tokens {
                         logger.debug("🚨 Crisis phrase matched: \"\(crisis.phrase)\"")
                         
-                        // Execute Proximity-Based Mitigation Check (6-word window)
                         let windowStart = max(0, i - 6)
-                        let windowEnd = min(tokens.count, endIndex + 6)
+                        let windowEnd = min(rawTokens.count, endIndex + 6)
                         
                         var isMitigated = false
                         var isCausative = false
+                        var isProtected = false
                         
                         for j in windowStart..<windowEnd {
-                            let token = tokens[j]
-                            if mitigationTokens.contains(token) {
-                                // Recursive Intent Check: Look back 3 words for causation
+                            let token = rawTokens[j]
+                            
+                            // Check for Protective Wrapper (e.g. "prevention")
+                            if protectiveTokens.contains(token) {
+                                // Must be within a very tight 3-word window to count as protective wrapper
+                                if abs(j - i) <= 3 || abs(j - (endIndex - 1)) <= 3 {
+                                    isProtected = true
+                                    logger.debug("🛡️ Protective Wrapper Triggered: \"\(token)\"")
+                                    break
+                                }
+                            }
+                            
+                            // Check for Generic Virtual Mitigation
+                            if mitigationTokens.contains(token) && !isProtected {
                                 let startPrev = max(0, j - 3)
-                                let precedingTokens = tokens[startPrev..<j]
+                                let precedingTokens = rawTokens[startPrev..<j]
                                 
                                 if precedingTokens.contains(where: { causativeTokens.contains($0) }) {
                                     isCausative = true
                                     logger.debug("⚠️ Action attributed TO virtual context (causative) — NO MITIGATION")
-                                    // Keep searching window, maybe another token mitigates
                                 } else {
                                     isMitigated = true
-                                    logger.debug("🛡️ Mitigation Triggered: Proximity to fantasy/gaming token \"\(token)\"")
-                                    break
+                                    logger.debug("🛡️ Virtual Mitigation Triggered: \"\(token)\"")
                                 }
                             }
                         }
                         
-                        // Calculate the final situational weight of this crisis
                         let finalWeight: Double
-                        if isMitigated {
-                            // Virtual context: De-escalate to moderate distress
-                            finalWeight = -0.25
+                        if isProtected {
+                            finalWeight = 0.0 // Completely neutralize
+                        } else if isMitigated && !isCausative {
+                            finalWeight = -0.25 // De-escalate virtual
                         } else if isCausative {
-                            // "Because of game": Intense distress caused by gaming
-                            finalWeight = max(-0.9, crisis.weight)
+                            finalWeight = max(-0.9, crisis.weight) // Intense distress caused by gaming
                         } else {
-                            // Real-world crisis: maintain absolute severity
-                            finalWeight = crisis.weight
+                            finalWeight = crisis.weight // Maintain real-world severity
                         }
                         
-                        // Only anchor the MOST extreme severity we find across the whole text
-                        if let existing = crisisFloor {
-                            crisisFloor = min(existing, finalWeight)
-                        } else {
-                            crisisFloor = finalWeight
+                        // Ignore neutralized phrases
+                        if finalWeight < -0.1 {
+                            if let existing = globalCrisisFloor {
+                                globalCrisisFloor = min(existing, finalWeight)
+                            } else {
+                                globalCrisisFloor = finalWeight
+                            }
                         }
                     }
                 }
             }
         }
 
-        // If a valid crisis floor triggered (mitigated or not), snap to it
-        if let floor = crisisFloor {
-            logger.debug("📌 Final Phase 2 Crisis Floor Applied: \(floor)")
+        // If a valid unmodified crisis floor triggered, snap to it overrides everything.
+        if let floor = globalCrisisFloor {
+            logger.debug("📌 Final Phase 1 Crisis Floor Applied: \(floor)")
             return floor
         }
 
-        // ── Phase 3: Tokenize with Look-Back Window ──
-        var accumulatedWeight: Double = 0.0
-        var matchCount: Int = 0
+        // ── Phase 2: Structural Clause-Based Polarity Checking (Ambiguity Guard) ──
+        
+        let delimiters = CharacterSet(charactersIn: ".,;!?") 
+        var textToSplit = lowered
+        
+        // Convert conjunctions to common delimiters to force clause splits
+        let splitters = [" but ", " however ", " although ", " yet ", " except ", " and "]
+        for conj in splitters {
+            textToSplit = textToSplit.replacingOccurrences(of: conj, with: ".")
+        }
+        
+        let rawClauses = textToSplit.components(separatedBy: delimiters)
+        var maxExtremeScore: Double = 0.0
+        
+        for rawClause in rawClauses {
+            let clause = rawClause.trimmingCharacters(in: .whitespaces)
+            if clause.isEmpty { continue }
+            
+            let clauseTokens = clause.components(separatedBy: .whitespaces).filter { !$0.isEmpty }
+            
+            var clauseAccumulated: Double = 0.0
+            var clauseMatches = 0
+            var polarityFlipCount = 0
+            var containsFamily = false
+            
+            for token in clauseTokens {
+                // Strip stray punctuation that stuck to the token
+                let cleanToken = token.trimmingCharacters(in: .punctuationCharacters)
+                if cleanToken.isEmpty { continue }
 
-        for i in 0..<tokens.count {
-            let word = tokens[i]
+                // Negation Tracking
+                if negations.contains(cleanToken) {
+                    polarityFlipCount += 1
+                    logger.debug("🔄 Polarity flip count incremented to \(polarityFlipCount) (token: \(cleanToken))")
+                    continue
+                }
+                
+                // Familial Token Tracking
+                if familialTokens.contains(cleanToken) {
+                    containsFamily = true
+                }
 
-            guard let baseWeight = sentimentLexicon[word] else { continue }
+                guard let baseWeight = sentimentLexicon[cleanToken] else { continue }
+                var adjustedWeight = baseWeight
 
-            var adjustedWeight = baseWeight
-
-            // Look back at the previous token
-            if i > 0 {
-                let previous = tokens[i - 1]
-
-                if negations.contains(previous) {
-                    // Negation: invert polarity
-                    // "not sad" → sad(-0.4) becomes +0.4
+                // Apply recursive polarity (odd flips = invert)
+                if polarityFlipCount % 2 != 0 {
                     adjustedWeight = -adjustedWeight
-                    logger.debug("🔄 Negation: \"\(previous) \(word)\" → \(adjustedWeight)")
-                } else if intensifiers.contains(previous) {
-                    // Intensifier: boost magnitude by 50%
-                    // "really sad" → sad(-0.4) × 1.5 = -0.6
-                    adjustedWeight *= 1.5
-                    logger.debug("⬆️ Intensifier: \"\(previous) \(word)\" → \(adjustedWeight)")
+                    logger.debug("🔄 Inverted value: \(baseWeight) -> \(adjustedWeight)")
+                }
+
+                // If prior was intensifier, wait we can't reliably index if we skip 'not' above.
+                // Simple heuristic: check if prior token in the original split is intensifier.
+                if let index = clauseTokens.firstIndex(of: token), index > 0 {
+                    let prior = clauseTokens[index - 1].trimmingCharacters(in: .punctuationCharacters)
+                    if intensifiers.contains(prior) {
+                        adjustedWeight *= 1.5
+                    }
+                }
+
+                clauseAccumulated += max(-1.0, min(1.0, adjustedWeight))
+                clauseMatches += 1
+            }
+            
+            if clauseMatches > 0 {
+                var clauseAvg = clauseAccumulated / Double(clauseMatches)
+                
+                // Interpersonal Directionality Penalty
+                if containsFamily && clauseAvg < 0 {
+                    clauseAvg *= 1.2
+                    clauseAvg = max(-1.0, clauseAvg)
+                    logger.debug("👪 Familial Token Multiplier Applied: -> \(clauseAvg)")
+                }
+                
+                clauseAvg = max(-1.0, min(1.0, clauseAvg))
+                
+                // Ambiguity Guard: Anchors to the most extreme absolute clause
+                if abs(clauseAvg) > abs(maxExtremeScore) {
+                    maxExtremeScore = clauseAvg
                 }
             }
-
-            // Clamp individual adjusted weights to [-1.0, 1.0]
-            adjustedWeight = max(-1.0, min(1.0, adjustedWeight))
-
-            accumulatedWeight += adjustedWeight
-            matchCount += 1
         }
 
-        guard matchCount > 0 else { return 0.0 }
-
-        // Weighted average, clamped
-        let average = accumulatedWeight / Double(matchCount)
-        return max(-1.0, min(1.0, average))
+        return max(-1.0, min(1.0, maxExtremeScore))
     }
 
     // MARK: - Private: Vector Embedding

@@ -49,7 +49,7 @@ struct VoiceVaultApp: App {
 
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            DebugContentView()
                 .environment(environment)
         }
         .modelContainer(sharedModelContainer)
