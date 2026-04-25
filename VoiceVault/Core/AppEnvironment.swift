@@ -8,6 +8,7 @@
 
 import Foundation
 import os
+import SwiftData
 
 // MARK: - AppEnvironment
 
@@ -28,13 +29,21 @@ import os
 /// ```swift
 /// @main
 /// struct VoiceVaultApp: App {
-///     @State private var environment = AppEnvironment.production()
+///     let container: ModelContainer
+///     @State private var environment: AppEnvironment
+///
+///     init() {
+///         let container = try! ModelContainer(for: JournalEntry.self)
+///         self.container = container
+///         _environment = State(initialValue: AppEnvironment.production(modelContainer: container))
+///     }
 ///
 ///     var body: some Scene {
 ///         WindowGroup {
 ///             ContentView()
 ///                 .environment(environment)
 ///         }
+///         .modelContainer(container)
 ///     }
 /// }
 /// ```
@@ -110,18 +119,18 @@ extension AppEnvironment {
     /// Each real service uses native Apple frameworks (AVFoundation, Speech,
     /// NaturalLanguage, SwiftData) — no third-party dependencies.
     ///
+    /// - Parameter modelContainer: The SwiftData `ModelContainer` from the app scene.
+    ///   Its `mainContext` is injected into the `StorageService`.
     /// - Returns: An `AppEnvironment` configured with production services.
-    static func production() -> AppEnvironment {
-        // TODO: [team] Replace mocks with real implementations as they become available.
-        // During initial parallel development, all services start as mocks so the
-        // UI team (Developer D) can build against realistic data immediately.
+    @MainActor
+    static func production(modelContainer: ModelContainer) -> AppEnvironment {
         let logger = Logger(subsystem: "com.voicevault.app", category: "production")
-        logger.info("🔧 Initializing VoiceVault production environment")
+        logger.info("🔧 Initializing VoiceVault production environment — all services LIVE")
 
         return AppEnvironment(
             audioService: AudioTranscriptionService(),
-            intelligenceService: MockIntelligenceService(),
-            storageService: MockStorageService(),
+            intelligenceService: IntelligenceService(),
+            storageService: StorageService(modelContext: modelContainer.mainContext),
             logger: logger
         )
     }
@@ -130,11 +139,12 @@ extension AppEnvironment {
     ///
     /// Use this in SwiftUI `#Preview` blocks and unit tests.
     /// All mock services return deterministic, medical-grade dummy data instantly.
+    /// Does NOT require a `ModelContainer`.
     ///
     /// - Returns: An `AppEnvironment` configured with mock services.
     static func preview() -> AppEnvironment {
         return AppEnvironment(
-            audioService: AudioTranscriptionService(),
+            audioService: MockAudioTranscriptionService(),
             intelligenceService: MockIntelligenceService(),
             storageService: MockStorageService.withSampleData(),
             logger: Logger(subsystem: "com.voicevault.app", category: "preview")
