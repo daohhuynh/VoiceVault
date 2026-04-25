@@ -8,10 +8,7 @@
 //  │  THIS IS YOUR DOMAIN. Build the consumer recording UI here. │
 //  │                                                             │
 //  │  Design Language:                                           │
-//  │  • Hyper-minimalist, dark-mode-first                        │
-//  │  • Premium mic interaction (tap-to-record, waveform viz)    │
-//  │  • "Gentle nudges" — soft haptics, breathing-pace prompts   │
-//  │  • The feel: intimate, safe, private                        │
+//  │  • You have full autonomy over the UI design and UX.        │
 //  │                                                             │
 //  │  Key Screens:                                               │
 //  │  • RecordingView — the core mic + waveform experience       │

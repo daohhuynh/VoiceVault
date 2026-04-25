@@ -40,25 +40,23 @@
 ├──────────────────────────────────────────────────────────────────────┤
 │  Dev 3 — Patient "Vault" Architect (Consumer UI)                    │
 │  Owns: Views/Patient/, ViewModels/Patient/                          │
-│  Mission: Hyper-minimalist, dark-mode recording experience.         │
-│           Premium mic interaction, waveform animations, gentle      │
-│           nudges. Does NOT touch the database directly — pulls      │
+│  Mission: Build the patient recording UI and logic.                 │
+│           Does NOT touch the database directly — pulls              │
 │           exclusively from MockAudioTranscriptionService.            │
-│           Make the recording feel safe, intimate, and frictionless.  │
+│           You have full autonomy over the UI design and UX.          │
 ├──────────────────────────────────────────────────────────────────────┤
 │  Dev 4 — Clinical Data Viz Lead (Provider UI)                       │
 │  Owns: Views/Provider/, ViewModels/Provider/                        │
-│  Mission: Dense, Bloomberg-terminal-style clinical dashboard.       │
-│           Lives in Swift Charts. Uses MockStorageService to pull     │
-│           realistic SSRI/migraine/sleep-apnea mock data and build   │
-│           sentiment timelines, keyword heatmaps, entry drill-downs. │
-│           Make the data feel clinical, trustworthy, and actionable.  │
+│  Mission: Build the clinical data viz dashboard.                    │
+│           Uses MockStorageService to pull realistic SSRI/migraine/  │
+│           sleep-apnea mock data. You have full autonomy over the UI  │
+│           design and UX.                                             │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Why This Split
-- **Two UI devs = 2x polish.** Patient and Provider are different apps 
-  with different design languages. Splitting them doubles visual output.
+- **Two UI devs = 2x output.** Patient and Provider are different apps. 
+  Splitting them doubles output.
 - **Brain owns vector→DB.** The tightest coupling in the system (NLP 
   output → SwiftData persistence) lives in ONE person's head.
 - **Mock safety net.** If real services fail at 6 AM, leave 
@@ -212,8 +210,8 @@ The following patterns are BANNED and must NEVER appear in this codebase:
 - Examples:
   - `[audio] implement real-time speech recognition pipeline`
   - `[brain] integrate NLEmbedding with SwiftData persistence`
-  - `[patient-ui] add waveform animation to recording screen`
-  - `[provider-ui] build sentiment timeline with Swift Charts`
+  - `[patient-ui] add recording screen layout`
+  - `[provider-ui] build dashboard data views`
 
 ### 12. Branch Strategy
 - `main` — stable, buildable at all times

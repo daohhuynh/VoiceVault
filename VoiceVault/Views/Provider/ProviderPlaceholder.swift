@@ -8,9 +8,7 @@
 //  │  THIS IS YOUR DOMAIN. Build the clinical dashboard here.    │
 //  │                                                             │
 //  │  Design Language:                                           │
-//  │  • Dense, information-rich, Bloomberg-terminal aesthetic    │
-//  │  • Light-mode optimized (clinical/medical readability)      │
-//  │  • Data confidence radiates from every pixel                │
+//  │  • You have full autonomy over the UI design and UX.        │
 //  │                                                             │
 //  │  Key Screens:                                               │
 //  │  • DashboardView — sentiment timeline + keyword heatmap     │
