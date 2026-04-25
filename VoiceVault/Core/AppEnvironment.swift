@@ -119,7 +119,7 @@ extension AppEnvironment {
         logger.info("🔧 Initializing VoiceVault production environment")
 
         return AppEnvironment(
-            audioService: MockAudioTranscriptionService(),
+            audioService: AudioTranscriptionService(),
             intelligenceService: MockIntelligenceService(),
             storageService: MockStorageService(),
             logger: logger
@@ -134,7 +134,7 @@ extension AppEnvironment {
     /// - Returns: An `AppEnvironment` configured with mock services.
     static func preview() -> AppEnvironment {
         return AppEnvironment(
-            audioService: MockAudioTranscriptionService(),
+            audioService: AudioTranscriptionService(),
             intelligenceService: MockIntelligenceService(),
             storageService: MockStorageService.withSampleData(),
             logger: Logger(subsystem: "com.voicevault.app", category: "preview")

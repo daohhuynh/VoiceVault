@@ -1,29 +1,40 @@
-//
-//  ContentView.swift
-//  VoiceVault
-//
-//  Created by Dao Huynh on 4/25/26.
-//
-//  NOTE: This is a placeholder root view. Developer D owns this file.
-//  Replace with the real UI implementation.
-//
-
 import SwiftUI
-import SwiftData
 
 struct ContentView: View {
-    @Environment(AppEnvironment.self) private var environment
-
+    @Environment(AppEnvironment.self) private var env
+    @State private var isRecording = false
+    @State private var transcript = "Waiting for audio..."
+    
     var body: some View {
-        NavigationStack {
-            Text("VoiceVault")
-                .font(.largeTitle)
-                .fontWeight(.bold)
+        VStack(spacing: 30) {
+            Text(transcript)
+                .font(.system(.body, design: .monospaced))
+                .padding()
+            
+            Button(action: {
+                Task {
+                    if isRecording {
+                        await env.audioService.stopRecording()
+                        isRecording = false
+                    } else {
+                        isRecording = true
+                        do {
+                            // The intent might require different params based on your protocol
+                            transcript = try await env.audioService.transcribe(intent: .init())
+                        } catch {
+                            transcript = "Error: \(error.localizedDescription)"
+                            isRecording = false
+                        }
+                    }
+                }
+            }) {
+                Text(isRecording ? "STOP RECORDING" : "TEST MICROPHONE")
+                    .font(.headline)
+                    .foregroundColor(.white)
+                    .padding()
+                    .background(isRecording ? Color.red : Color.blue)
+                    .cornerRadius(10)
+            }
         }
     }
-}
-
-#Preview {
-    ContentView()
-        .environment(AppEnvironment.preview())
 }

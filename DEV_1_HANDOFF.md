@@ -33,4 +33,4 @@ Crucial Constraints:
 3. Handle the `AVAudioSession` setup (category: `.record`, mode: `.measurement`).
 4. Output the raw text string continuously or upon completion.
 
-Generate the production-ready Swift code."
+Generate the production-ready Swift code.
