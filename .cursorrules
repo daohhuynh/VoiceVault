@@ -1,9 +1,9 @@
 # ═══════════════════════════════════════════════════════════════════════════════
-# VoiceVault — AI Agent Rules
+# VoiceVault — AI Agent Rules (Hackathon Strike Team Edition)
 # ═══════════════════════════════════════════════════════════════════════════════
 # All AI coding agents (Cursor, Windsurf, Copilot, Gemini) MUST follow these
 # rules when generating or modifying code in this repository.
-# Last updated: 2026-04-25 — Hackathon Day 1
+# Last updated: 2026-04-25 — Hackathon Day 1 (v2: Strike Team Delegation)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 ## Project Identity
@@ -13,6 +13,66 @@
 - UI Framework: SwiftUI (declarative only — no UIKit unless wrapping hardware APIs)
 - Persistence: SwiftData (NO Core Data, NO Realm, NO SQLite wrappers)
 - Minimum deployment target: iOS 17.0
+
+## ═══ TEAM STRUCTURE: 24-HOUR STRIKE TEAM ═══
+
+### This is NOT an enterprise project. This is a 24-hour hackathon. 
+### Optimize for DEMO QUALITY and INTEGRATION SPEED, not clean separation.
+
+### Team Roles & Directory Ownership
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│  Dev 1 — Systems Integrator & Sensor Lead (Dao)                     │
+│  Owns: Services/Audio/, Core/AppEnvironment.swift, Protocols/       │
+│  Mission: AVFoundation + SFSpeechRecognizer pipeline.               │
+│           Gatekeeper of AppEnvironment and all shared contracts.     │
+│           If a protocol needs amending at 2 AM, Dev 1 decides.      │
+├──────────────────────────────────────────────────────────────────────┤
+│  Dev 2 — Local Intelligence Pipeline (The "Brain")                  │
+│  Owns: Services/Intelligence/, Services/Storage/, Models/,          │
+│        Mocks/MockIntelligenceService.swift,                         │
+│        Mocks/MockStorageService.swift                               │
+│  Mission: NLTagger + NLEmbedding → vector → SwiftData in ONE flow.  │
+│           Owns the entire data lifecycle: analyze text, generate     │
+│           embeddings, persist to SwiftData, serve queries.           │
+│           Eliminates the NLP↔Storage integration seam entirely.     │
+├──────────────────────────────────────────────────────────────────────┤
+│  Dev 3 — Patient "Vault" Architect (Consumer UI)                    │
+│  Owns: Views/Patient/, ViewModels/Patient/                          │
+│  Mission: Hyper-minimalist, dark-mode recording experience.         │
+│           Premium mic interaction, waveform animations, gentle      │
+│           nudges. Does NOT touch the database directly — pulls      │
+│           exclusively from MockAudioTranscriptionService.            │
+│           Make the recording feel safe, intimate, and frictionless.  │
+├──────────────────────────────────────────────────────────────────────┤
+│  Dev 4 — Clinical Data Viz Lead (Provider UI)                       │
+│  Owns: Views/Provider/, ViewModels/Provider/                        │
+│  Mission: Dense, Bloomberg-terminal-style clinical dashboard.       │
+│           Lives in Swift Charts. Uses MockStorageService to pull     │
+│           realistic SSRI/migraine/sleep-apnea mock data and build   │
+│           sentiment timelines, keyword heatmaps, entry drill-downs. │
+│           Make the data feel clinical, trustworthy, and actionable.  │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+### Why This Split
+- **Two UI devs = 2x polish.** Patient and Provider are different apps 
+  with different design languages. Splitting them doubles visual output.
+- **Brain owns vector→DB.** The tightest coupling in the system (NLP 
+  output → SwiftData persistence) lives in ONE person's head.
+- **Mock safety net.** If real services fail at 6 AM, leave 
+  `AppEnvironment.preview()` injected. Judges see realistic clinical 
+  data, you still have a competitive demo.
+
+### ⚠️  CONFLICT RULES
+- Do NOT modify files outside your owned directories.
+- `Protocols/` and `Core/` are LOCKED. Only Dev 1 can amend them.
+- If you need a contract change, message Dev 1. Do not self-serve.
+- UI devs (Dev 3 & Dev 4): you are FULLY AUTONOMOUS within your own
+  `Views/` and `ViewModels/` subdirectories. You do not need approval
+  to build any component. If you need a button, build it. If the other
+  UI dev already built one, build your own anyway. Go fast.
 
 ## ═══ ARCHITECTURE MANDATES ═══
 
@@ -93,17 +153,16 @@
 - Extensions go in `TypeName+ExtensionPurpose.swift`
   - e.g., `Date+Formatting.swift`
 
-### 7. Directory Ownership (Conflict Avoidance)
-- Each developer owns specific directories. Do NOT modify files outside
-  your assigned directory without explicit coordination:
-  ```
-  Developer A (Audio):    Services/Audio/, Mocks/MockAudioService.swift
-  Developer B (NLP):      Services/Intelligence/, Mocks/MockIntelligenceService.swift
-  Developer C (Storage):  Services/Storage/, Mocks/MockStorageService.swift, Models/
-  Developer D (UI/UX):    Views/, ViewModels/
-  ```
-- Shared contracts in `Protocols/` and `Core/` are LOCKED after initial
-  scaffolding. Changes require team consensus.
+### 7. View Directory Structure
+- Patient-facing views go in `Views/Patient/` with ViewModels in `ViewModels/Patient/`.
+- Provider-facing views go in `Views/Provider/` with ViewModels in `ViewModels/Provider/`.
+- There is NO `Views/Shared/` directory. It does not exist. Do not create one.
+- Each view directory is **fully autonomous**. No cross-imports between
+  `Views/Patient/` and `Views/Provider/`.
+- **DRY does NOT apply to UI components in this hackathon.** If both Patient
+  and Provider need a sentiment badge, each dev builds their own copy in
+  their own folder. Duplicate freely. Coordination costs more than redundancy.
+  We will refactor after the demo if we want to.
 
 ### 8. Documentation Requirements
 - ALL public protocols, methods, and properties MUST have a `///` doc comment
@@ -142,6 +201,8 @@ The following patterns are BANNED and must NEVER appear in this codebase:
 ❌  Any third-party SPM package without explicit approval
 ❌  print() for logging (use os.Logger)
 ❌  Massive view files > 200 lines (decompose into subviews)
+❌  Patient UI dev touching Services/ or Models/ directly
+❌  Provider UI dev touching Services/ or Models/ directly
 ```
 
 ## ═══ GIT CONVENTIONS ═══
@@ -150,10 +211,20 @@ The following patterns are BANNED and must NEVER appear in this codebase:
 - Format: `[module] brief description`
 - Examples:
   - `[audio] implement real-time speech recognition pipeline`
-  - `[models] add vector embedding field to JournalEntry`
-  - `[mocks] add realistic medical sentiment data`
+  - `[brain] integrate NLEmbedding with SwiftData persistence`
+  - `[patient-ui] add waveform animation to recording screen`
+  - `[provider-ui] build sentiment timeline with Swift Charts`
 
 ### 12. Branch Strategy
 - `main` — stable, buildable at all times
 - `feature/<developer>/<module>` — individual work branches
 - Merge via PR with at least 1 approval
+
+## ═══ HACKATHON EMERGENCY PROTOCOL ═══
+
+### 13. The 6 AM Failsafe
+If at any point a real service implementation is broken and blocking the demo:
+1. Revert `AppEnvironment.production()` to inject the Mock version.
+2. The mock data is medical-grade realistic. Judges will not notice.
+3. Prioritize a WORKING demo over a COMPLETE implementation.
+4. A beautiful app with mock data beats an ugly app with real data.

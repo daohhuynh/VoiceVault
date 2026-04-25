@@ -2,11 +2,14 @@
 //  AudioPlaceholder.swift
 //  VoiceVault
 //
-//  Developer A: Implement AudioTranscriptionService here.
+//  Owner: Dev 1 — Systems Integrator & Sensor Lead (Dao)
+//
+//  Implement AudioTranscriptionService here.
 //  Conform to AudioTranscriptionServiceProtocol.
 //  Use AVFoundation + Speech framework exclusively.
+//  Set requiresOnDeviceRecognition = true on all SFSpeechRecognitionRequest.
 //
 
 import Foundation
 
-// TODO: [Developer A] Create AudioTranscriptionService conforming to AudioTranscriptionServiceProtocol
+// TODO: [Dev 1] Create AudioTranscriptionService conforming to AudioTranscriptionServiceProtocol
