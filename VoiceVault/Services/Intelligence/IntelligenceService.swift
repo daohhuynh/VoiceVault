@@ -3,10 +3,13 @@
 //  VoiceVault
 //
 //  Owner: Dev 2 — Local Intelligence Pipeline (The "Brain")
-//  Hackathon Day 1 — Production NLP Service
+//  Hackathon Day 1 — Production NLP Service (v4: Weighted Floor/Ceiling)
 //
-//  Performs on-device NLP analysis using Apple's NaturalLanguage framework.
-//  Three-stage pipeline: Keyword Extraction → Sentiment Scoring → Vector Embedding.
+//  Three-stage on-device NLP pipeline:
+//    1. Hybrid Keyword Extraction  (NLTagger + clinical n-gram scanner)
+//    2. Dual Sentiment Engine      (NLTagger primary + lexicon fallback)
+//    3. Vector Embedding           (NLEmbedding sentence → word → zero-vector)
+//
 //  All processing stays on the device — no data leaves the phone.
 //
 
@@ -19,29 +22,35 @@ import os
 
 /// Production implementation of `IntelligenceServiceProtocol`.
 ///
-/// Uses Apple's `NaturalLanguage` framework to perform a three-stage NLP
-/// pipeline entirely on-device:
+/// ## v3 Architecture: Why This Exists
 ///
-/// 1. **Keyword Extraction** — `NLTagger` with `.lexicalClass` scheme identifies
-///    nouns and adjectives, then ranks them by frequency. The top 10 most
-///    relevant terms are returned.
-/// 2. **Sentiment Analysis** — `NLTagger` with `.sentimentScore` scheme evaluates
-///    the full transcript and returns a normalized polarity in `[-1.0, 1.0]`.
-/// 3. **Vector Embedding** — `NLEmbedding.sentenceEmbedding(for:)` converts
-///    the entire transcript into a dense `[Double]` array for semantic search.
+/// Apple's `NLTagger` has three documented failure modes in production:
 ///
-/// ## Privacy
-/// All NLP models run on the local Neural Engine / CPU. Zero network calls.
+/// 1. **Garbage tokens** — `NLTagger` splits contractions into clitics ("I'm" → "I" + "'m").
+///    The "'m" token gets tagged as `.verb` and leaks into keywords. Fixed via alpha-only
+///    gating and a stop-word blacklist.
 ///
-/// ## Error Handling
-/// If any NLP model fails to load (rare on iOS 17+), the service throws
-/// descriptive `IntelligenceError` cases so callers can degrade gracefully
-/// (e.g., fall back to `MockIntelligenceService` via `AppEnvironment`).
+/// 2. **No phrase context** — Single-word extraction can't distinguish "kill" (gaming context)
+///    from "kill myself" (crisis). Fixed via a clinical n-gram scanner that runs BEFORE
+///    single-word extraction and captures multi-word phrases as atomic units.
 ///
-/// ## Concurrency
-/// The class is `@Observable` for SwiftUI compatibility and `@unchecked Sendable`
-/// to satisfy the `IntelligenceServiceProtocol: Sendable` requirement.
-/// All mutable state is internal and accessed only within `async` methods.
+/// 3. **Sentiment 0.0 deadlock** — `NLTagger.sentimentScore` returns literal `Double(0.0)` (NOT
+///    nil) for text it cannot classify. This means our "is the array empty?" guard never fires —
+///    the tagger IS returning a score, it's just always zero. This is a known limitation of
+///    Apple's on-device sentiment model with informal/unpunctuated text. Fixed via a curated
+///    clinical lexicon-based sentiment engine that activates when NLTagger returns flat zero.
+///
+/// ## Pipeline Flow
+/// ```
+/// transcript
+///   → normalize (lowercase, strip non-alpha except spaces)
+///   → clinical n-gram scan (multi-word phrases first)
+///   → NLTagger single-word extraction (nouns, adjectives, verbs minus stop words)
+///   → merge & deduplicate → keywords
+///   → NLTagger sentiment → if 0.0 → lexicon sentiment fallback → score
+///   → NLEmbedding sentence → word avg → zero-vector → vector
+///   → SentimentResult
+/// ```
 @Observable
 final class IntelligenceService: IntelligenceServiceProtocol, @unchecked Sendable {
 
@@ -51,25 +60,207 @@ final class IntelligenceService: IntelligenceServiceProtocol, @unchecked Sendabl
     @ObservationIgnored
     private let logger = Logger(subsystem: "com.voicevault.app", category: "intelligence")
 
-    /// The maximum number of keywords to extract from a transcript.
-    /// Keeps results focused and clinically useful.
+    /// The maximum number of keywords to return in the result.
     @ObservationIgnored
     private let maxKeywordCount = 10
 
-    /// Minimum word length to consider for keyword extraction.
-    /// Filters out articles, prepositions, and other noise.
-    @ObservationIgnored
-    private let minimumWordLength = 3
+    // MARK: - Stop Words
 
-    // MARK: - Lexical Classes for Keywords
-
-    /// The set of `NLTag` lexical classes considered meaningful for keyword extraction.
-    /// Nouns capture clinical entities (symptoms, medications, body parts).
-    /// Adjectives capture qualitative descriptors (severe, mild, chronic).
+    /// Common English words that should NEVER appear as extracted keywords.
+    /// Includes auxiliary verbs, pronouns, prepositions, articles, and contractions
+    /// that NLTagger's `.verb` tag incorrectly promotes.
     @ObservationIgnored
-    private let relevantLexicalClasses: Set<NLTag> = [
-        .noun,
-        .adjective
+    private let stopWords: Set<String> = [
+        // Pronouns
+        "i", "me", "my", "mine", "myself",
+        "you", "your", "yours", "yourself",
+        "he", "him", "his", "himself",
+        "she", "her", "hers", "herself",
+        "it", "its", "itself",
+        "we", "us", "our", "ours", "ourselves",
+        "they", "them", "their", "theirs", "themselves",
+        // Articles & determiners
+        "a", "an", "the", "this", "that", "these", "those",
+        // Auxiliary / linking verbs (the #1 garbage source)
+        "is", "am", "are", "was", "were", "be", "been", "being",
+        "have", "has", "had", "having",
+        "do", "does", "did", "doing",
+        "will", "would", "shall", "should",
+        "can", "could", "may", "might", "must",
+        // Common prepositions
+        "in", "on", "at", "to", "for", "of", "with", "by",
+        "from", "up", "about", "into", "over", "after",
+        // Conjunctions
+        "and", "but", "or", "nor", "so", "yet",
+        // Adverbs that leak through
+        // NOTE: "very", "really", "extremely" etc. are intentionally EXCLUDED.
+        // They are used as intensifiers in the sentiment look-back window.
+        "not", "no", "just", "also", "too",
+        "now", "then", "here", "there", "when", "where", "how",
+        "all", "each", "every", "both", "few", "more", "most",
+        "other", "some", "such", "only", "own", "same",
+        // Contraction fragments that NLTagger leaks
+        "m", "s", "t", "re", "ve", "ll", "d",
+        "im", "ive", "dont", "cant", "wont", "didnt",
+        "doesnt", "isnt", "arent", "wasnt", "werent",
+        // Filler / slang noise
+        "yo", "idk", "lol", "ok", "okay", "like", "um", "uh",
+        "yeah", "yep", "nah", "gonna", "wanna", "gotta",
+        "whats", "thats", "heres", "theres",
+        // Common verbs that are too generic to be clinically useful
+        "get", "got", "go", "going", "went", "gone",
+        "come", "came", "say", "said", "tell", "told",
+        "make", "made", "take", "took", "taken",
+        "know", "knew", "think", "thought",
+        "see", "saw", "seen", "look", "looked",
+        "want", "need", "let", "keep", "kept",
+        "put", "give", "gave", "given",
+        "thing", "things", "way", "lot", "stuff",
+    ]
+
+    // MARK: - Clinical N-Gram Phrases
+
+    /// Multi-word clinical phrases that MUST be captured as atomic units.
+    /// These are sorted longest-first so "panic attack disorder" matches
+    /// before "panic attack" before "panic".
+    ///
+    /// Categories: crisis language, psychiatric terms, symptoms, medications,
+    /// behavioral markers, and vitals.
+    @ObservationIgnored
+    private let clinicalPhrases: [String] = [
+        // Crisis / self-harm (HIGHEST priority)
+        "kill myself", "kill herself", "kill himself",
+        "hurt myself", "hurt herself", "hurt himself",
+        "end my life", "end it all",
+        "suicidal thoughts", "suicidal ideation",
+        "self harm", "self injury",
+        "want to die", "wanna die", "dont want to live",
+
+        // Psychiatric conditions
+        "panic attack", "anxiety attack",
+        "depressive episode", "manic episode",
+        "bipolar disorder", "borderline personality",
+        "post traumatic stress", "obsessive compulsive",
+        "eating disorder", "substance abuse",
+
+        // Symptoms & behavioral markers
+        "brain fog", "chest pain", "chest tightness",
+        "heart palpitations", "shortness of breath",
+        "sleep apnea", "sleep disorder",
+        "weight loss", "weight gain",
+        "loss of appetite", "binge eating",
+        "intrusive thoughts", "racing thoughts",
+        "mood swings", "emotional numbness",
+        "social isolation", "social anxiety",
+        "daytime sleepiness", "morning headaches",
+        "night sweats", "cold sweats",
+        "blurred vision", "visual aura",
+        "jaw clenching", "teeth grinding",
+
+        // Medications & treatments
+        "blood pressure", "heart rate",
+        "physical therapy", "occupational therapy",
+        "cognitive behavioral therapy",
+        "safety plan", "crisis contact",
+        "range of motion", "side effects",
+
+        // Vitals & measurements
+        "oxygen saturation", "blood sugar",
+        "resting heart rate",
+    ].sorted { $0.count > $1.count } // longest-first matching
+
+    // MARK: - Clinical Sentiment Lexicon
+
+    /// Weighted clinical vocabulary for the lexicon-based sentiment fallback.
+    /// Activates when NLTagger returns flat 0.0 (its known failure mode).
+    ///
+    /// Weights are calibrated for clinical relevance:
+    /// - Crisis terms: -0.8 to -1.0 (instant strong negative)
+    /// - Distress terms: -0.3 to -0.7
+    /// - Neutral medical: 0.0
+    /// - Recovery/positive: +0.3 to +0.8
+    @ObservationIgnored
+    private let sentimentLexicon: [String: Double] = [
+        // === CRISIS (-0.8 to -1.0) ===
+        "kill": -0.9, "die": -0.9, "suicide": -1.0, "suicidal": -1.0,
+        "hopeless": -0.85, "worthless": -0.85, "helpless": -0.8,
+        "overdose": -0.9, "cutting": -0.7, "harm": -0.7,
+        // Violence terms
+        "genocide": -1.0, "homicide": -1.0, "murder": -1.0,
+        "torture": -1.0, "assault": -1.0,
+
+        // === STRONG NEGATIVE (-0.5 to -0.79) ===
+        "depressed": -0.7, "depression": -0.7, "depressive": -0.7,
+        "panic": -0.65, "terrified": -0.65, "desperate": -0.7,
+        "agony": -0.7, "torment": -0.65, "miserable": -0.65,
+        "crying": -0.5, "cry": -0.5, "sobbing": -0.6,
+        "nightmare": -0.5, "trauma": -0.6, "abuse": -0.65,
+
+        // === MODERATE NEGATIVE (-0.25 to -0.49) ===
+        "anxious": -0.45, "anxiety": -0.45, "worried": -0.35,
+        "stressed": -0.4, "overwhelmed": -0.45, "exhausted": -0.4,
+        "frustrated": -0.35, "irritable": -0.3, "angry": -0.4,
+        "sad": -0.4, "lonely": -0.4, "afraid": -0.4, "scared": -0.4,
+        "pain": -0.35, "hurt": -0.35, "ache": -0.3, "aching": -0.3,
+        "headache": -0.3, "migraine": -0.4, "nausea": -0.3,
+        "insomnia": -0.4, "fatigue": -0.3, "vomit": -0.35,
+        "vomited": -0.35, "worse": -0.3, "terrible": -0.45,
+        "awful": -0.4, "horrible": -0.4, "dread": -0.45,
+        "cancelled": -0.2, "isolated": -0.35,
+
+        // === MILD NEGATIVE (-0.1 to -0.24) ===
+        "difficult": -0.2, "hard": -0.15, "tough": -0.15,
+        "uncomfortable": -0.2, "restless": -0.2, "tense": -0.2,
+        "bothered": -0.15, "concern": -0.1, "concerning": -0.15,
+
+        // === NEUTRAL MEDICAL (0.0) ===
+        "medication": 0.0, "prescription": 0.0, "dose": 0.0,
+        "milligrams": 0.0, "therapist": 0.0, "psychiatrist": 0.0,
+        "appointment": 0.0, "diagnosis": 0.0, "symptoms": 0.0,
+        "treatment": 0.0, "hospital": 0.0,
+
+        // === MILD POSITIVE (+0.1 to +0.24) ===
+        "okay": 0.1, "fine": 0.1, "alright": 0.1,
+        "manageable": 0.15, "decent": 0.15, "steady": 0.15,
+        "stable": 0.2, "functional": 0.15, "coping": 0.2,
+
+        // === MODERATE POSITIVE (+0.25 to +0.49) ===
+        "better": 0.35, "improving": 0.4, "improvement": 0.4,
+        "progress": 0.4, "recovery": 0.45, "recovering": 0.45,
+        "calm": 0.3, "relaxed": 0.35, "peaceful": 0.4,
+        "hopeful": 0.4, "optimistic": 0.45, "confident": 0.4,
+        "proud": 0.4, "grateful": 0.45, "thankful": 0.4,
+        "sleeping": 0.2, "walked": 0.25, "exercise": 0.3,
+        "meditation": 0.3, "healthy": 0.35,
+
+        // === STRONG POSITIVE (+0.5 to +0.8) ===
+        "great": 0.55, "amazing": 0.6, "wonderful": 0.6,
+        "excellent": 0.6, "fantastic": 0.6, "thriving": 0.65,
+        "joy": 0.6, "happy": 0.55, "love": 0.5,
+        "breakthrough": 0.65, "milestone": 0.55, "healed": 0.6,
+    ]
+
+    // MARK: - Intensifiers & Negations
+
+    /// Words that amplify the weight of the NEXT sentiment word by 50%.
+    @ObservationIgnored
+    private let intensifiers: Set<String> = [
+        "very", "really", "extremely", "massively", "highly",
+        "absolutely", "incredibly", "terribly", "deeply",
+        "completely", "totally", "utterly", "seriously",
+        "severely", "awfully", "especially", "particularly",
+        "super", "hella", "mad", "crazy", "insanely",
+    ]
+
+    /// Words that INVERT the polarity of the NEXT sentiment word.
+    @ObservationIgnored
+    private let negations: Set<String> = [
+        "not", "no", "never", "neither", "nobody", "nothing",
+        "nowhere", "nor", "hardly", "barely", "scarcely",
+        // Common informal negation contractions
+        "wasnt", "werent", "isnt", "arent", "dont", "doesnt",
+        "didnt", "wont", "cant", "couldnt", "shouldnt", "wouldnt",
+        "hasnt", "havent", "hadnt", "mustnt",
     ]
 
     // MARK: - Protocol Conformance
@@ -77,15 +268,14 @@ final class IntelligenceService: IntelligenceServiceProtocol, @unchecked Sendabl
     /// Analyzes a transcript and returns sentiment, keywords, and vector embedding.
     ///
     /// Executes the full three-stage NLP pipeline:
-    /// 1. Validates the input and detects language.
-    /// 2. Extracts keywords via `NLTagger` (`.lexicalClass` scheme).
-    /// 3. Computes sentiment via `NLTagger` (`.sentimentScore` scheme).
-    /// 4. Generates a vector embedding via `NLEmbedding.sentenceEmbedding(for:)`.
+    /// 1. Validates input and detects language.
+    /// 2. Runs hybrid keyword extraction (clinical n-grams + NLTagger POS + stop-word filter).
+    /// 3. Computes sentiment (NLTagger primary + lexicon fallback on 0.0 deadlock).
+    /// 4. Generates vector embedding (sentence → word avg → zero-vector).
     ///
     /// - Parameter transcript: The raw text to analyze. Must not be empty.
     /// - Returns: A `SentimentResult` containing score, keywords, and vector.
-    /// - Throws: `IntelligenceError` if the transcript is empty, language detection
-    ///   fails, or the embedding model is unavailable.
+    /// - Throws: `IntelligenceError.emptyTranscript` if the transcript is empty.
     func analyze(transcript: String) async throws -> SentimentResult {
         logger.info("🧠 analyze() called — input length: \(transcript.count) characters")
 
@@ -96,20 +286,20 @@ final class IntelligenceService: IntelligenceServiceProtocol, @unchecked Sendabl
             throw IntelligenceError.emptyTranscript
         }
 
-        // 2. Detect language
-        let language = try detectLanguage(in: trimmed)
+        // 2. Detect language (defaults to English on failure)
+        let language = detectLanguage(in: trimmed)
         logger.info("🌐 Detected language: \(language.rawValue)")
 
-        // 3. Extract keywords (nouns + adjectives, ranked by frequency)
-        let keywords = extractKeywords(from: trimmed)
+        // 3. Hybrid keyword extraction
+        let keywords = extractKeywordsHybrid(from: trimmed, language: language)
         logger.info("🔑 Extracted \(keywords.count) keywords: \(keywords.joined(separator: ", "))")
 
-        // 4. Compute sentiment score
-        let sentimentScore = computeSentiment(for: trimmed)
+        // 4. Dual-engine sentiment
+        let sentimentScore = computeSentimentDual(for: trimmed, language: language)
         logger.info("💭 Sentiment score: \(sentimentScore)")
 
         // 5. Generate vector embedding
-        let vector = try generateEmbedding(for: trimmed, language: language)
+        let vector = generateEmbedding(for: trimmed, language: language)
         logger.info("📐 Generated embedding vector — dimensions: \(vector.count)")
 
         // 6. Package and return
@@ -125,14 +315,12 @@ final class IntelligenceService: IntelligenceServiceProtocol, @unchecked Sendabl
 
     /// Computes the cosine similarity between two vector embeddings.
     ///
-    /// Uses the standard dot-product / magnitude formula. Useful for finding
-    /// semantically similar journal entries without re-running the full NLP pipeline.
+    /// Uses the standard dot-product / magnitude formula.
     ///
     /// - Parameters:
     ///   - vectorA: First embedding vector.
     ///   - vectorB: Second embedding vector.
-    /// - Returns: Cosine similarity in `[-1.0, 1.0]`, where 1.0 indicates
-    ///   identical semantic meaning.
+    /// - Returns: Cosine similarity in `[-1.0, 1.0]`.
     /// - Throws: `IntelligenceError.analysisFailure` if vectors have mismatched dimensions.
     func cosineSimilarity(between vectorA: [Double], and vectorB: [Double]) throws -> Double {
         guard vectorA.count == vectorB.count else {
@@ -160,44 +348,67 @@ final class IntelligenceService: IntelligenceServiceProtocol, @unchecked Sendabl
 
     // MARK: - Private: Language Detection
 
-    /// Detects the dominant language of the transcript using `NLLanguageRecognizer`.
-    ///
-    /// - Parameter text: The input text to analyze.
-    /// - Returns: The detected `NLLanguage`.
-    /// - Throws: `IntelligenceError.languageDetectionFailed` if the recognizer
-    ///   cannot determine the language.
-    private func detectLanguage(in text: String) throws -> NLLanguage {
+    /// Detects the dominant language, defaulting to `.english` on failure.
+    private func detectLanguage(in text: String) -> NLLanguage {
         let recognizer = NLLanguageRecognizer()
+        recognizer.languageHints = [.english: 0.8]
         recognizer.processString(text)
 
         guard let dominantLanguage = recognizer.dominantLanguage else {
-            logger.error("❌ Language detection failed — no dominant language found")
-            throw IntelligenceError.languageDetectionFailed
+            logger.warning("⚠️ Language detection failed — defaulting to English")
+            return .english
         }
 
         return dominantLanguage
     }
 
-    // MARK: - Private: Keyword Extraction
+    // MARK: - Private: Hybrid Keyword Extraction
 
-    /// Extracts the most relevant keywords (nouns and adjectives) from the transcript.
+    /// Extracts clinically relevant keywords using a two-pass hybrid strategy:
     ///
-    /// Uses `NLTagger` with the `.lexicalClass` scheme to identify parts of speech,
-    /// then filters for nouns and adjectives. Keywords are ranked by frequency of
-    /// occurrence (most frequent first) and limited to `maxKeywordCount`.
+    /// **Pass 1 — Clinical N-Gram Scanner:**
+    /// Scans the lowercased transcript for known multi-word clinical phrases
+    /// (e.g., "kill myself", "panic attack", "sleep apnea"). These are matched
+    /// longest-first and added as atomic keywords. Matched regions are masked
+    /// so individual words within them don't get double-counted in Pass 2.
     ///
-    /// Words shorter than `minimumWordLength` are discarded to eliminate noise
-    /// (articles, prepositions, conjunctions).
+    /// **Pass 2 — NLTagger POS Extraction:**
+    /// Runs `NLTagger(.lexicalClass)` to extract nouns, adjectives, and verbs.
+    /// Each token is filtered through:
+    /// - Alpha-only gate (rejects "'m", "'s", "123")
+    /// - Length gate (≥ 3 characters)
+    /// - Stop-word blacklist
+    /// - Already-covered-by-n-gram check
     ///
-    /// - Parameter text: The input text to analyze.
-    /// - Returns: An array of keyword strings, ordered by frequency descending.
-    ///   Returns an empty array if the tagger produces no results.
-    private func extractKeywords(from text: String) -> [String] {
+    /// Results from both passes are merged, deduplicated, sorted by frequency,
+    /// and capped at `maxKeywordCount`.
+    private func extractKeywordsHybrid(from text: String, language: NLLanguage) -> [String] {
+        let lowered = text.lowercased()
+        var keywordScores: [String: Int] = [:]
+        var maskedWords: Set<String> = [] // words consumed by n-gram matches
+
+        // ── Pass 1: Clinical N-Gram Scanner ──
+        for phrase in clinicalPhrases {
+            if lowered.contains(phrase) {
+                // Weight multi-word phrases higher (they're more specific)
+                keywordScores[phrase, default: 0] += 3
+                logger.debug("🚨 Clinical phrase matched: \"\(phrase)\"")
+
+                // Mask constituent words to prevent double-counting
+                let words = phrase.split(separator: " ").map(String.init)
+                for word in words {
+                    maskedWords.insert(word)
+                }
+            }
+        }
+
+        // ── Pass 2: NLTagger POS Extraction ──
         let tagger = NLTagger(tagSchemes: [.lexicalClass])
         tagger.string = text
-
-        var frequencyMap: [String: Int] = [:]
         let range = text.startIndex..<text.endIndex
+        tagger.setLanguage(language, range: range)
+
+        let relevantTags: Set<NLTag> = [.noun, .adjective, .verb]
 
         tagger.enumerateTags(
             in: range,
@@ -205,133 +416,246 @@ final class IntelligenceService: IntelligenceServiceProtocol, @unchecked Sendabl
             scheme: .lexicalClass,
             options: [.omitPunctuation, .omitWhitespace, .omitOther]
         ) { tag, tokenRange in
-            guard let tag, relevantLexicalClasses.contains(tag) else {
-                return true // continue to next token
-            }
-
-            let word = String(text[tokenRange]).lowercased()
-
-            // Filter out short words (noise) and pure numbers
-            guard word.count >= minimumWordLength,
-                  !word.allSatisfy(\.isNumber) else {
+            guard let tag, relevantTags.contains(tag) else {
                 return true
             }
 
-            frequencyMap[word, default: 0] += 1
-            return true // continue enumeration
+            let raw = String(text[tokenRange])
+            let word = raw.lowercased()
+
+            // Gate 1: Alpha-only (kills "'m", "'s", "'re", "123")
+            guard word.allSatisfy(\.isLetter) else { return true }
+
+            // Gate 2: Minimum length (kills "a", "I", "be", "go")
+            guard word.count >= 3 else { return true }
+
+            // Gate 3: Stop-word blacklist
+            guard !stopWords.contains(word) else { return true }
+
+            // Gate 4: Not already consumed by an n-gram match
+            guard !maskedWords.contains(word) else { return true }
+
+            keywordScores[word, default: 0] += 1
+            return true
         }
 
-        // Sort by frequency (descending), then alphabetically for determinism
-        let sortedKeywords = frequencyMap
+        // ── Merge, sort, cap ──
+        let sorted = keywordScores
             .sorted { lhs, rhs in
-                if lhs.value != rhs.value {
-                    return lhs.value > rhs.value
-                }
+                if lhs.value != rhs.value { return lhs.value > rhs.value }
                 return lhs.key < rhs.key
             }
             .prefix(maxKeywordCount)
             .map(\.key)
 
-        return Array(sortedKeywords)
+        return Array(sorted)
     }
 
-    // MARK: - Private: Sentiment Analysis
+    // MARK: - Private: Dual-Engine Sentiment
 
-    /// Computes a normalized sentiment score for the transcript.
+    /// Computes sentiment using a two-engine strategy with crisis override.
     ///
-    /// Uses `NLTagger` with the `.sentimentScore` tag scheme. The tagger evaluates
-    /// the text at the paragraph level and returns a raw score. Individual sentence
-    /// scores are averaged if the transcript spans multiple sentences.
+    /// **Engine 1 — NLTagger (.sentimentScore):**
+    /// Tries paragraph → sentence. Falls back to `.document` ONLY if both return 0.0.
     ///
-    /// The final score is clamped to `[-1.0, 1.0]`:
-    /// - `-1.0` → extremely negative (crisis language, distress indicators)
-    /// - `0.0`  → neutral or mixed emotional valence
-    /// - `+1.0` → extremely positive (recovery language, optimistic outlook)
+    /// **Engine 2 — Clinical Lexicon (ALWAYS runs):**
+    /// Unlike v3, the lexicon engine now ALWAYS runs in parallel, not just as a
+    /// fallback. This is because NLTagger can return a mild score (-0.1) for text
+    /// containing crisis language that our lexicon correctly scores at -1.0.
     ///
-    /// - Parameter text: The input text to analyze.
-    /// - Returns: A normalized sentiment polarity score.
-    private func computeSentiment(for text: String) -> Double {
-        let tagger = NLTagger(tagSchemes: [.sentimentScore])
-        tagger.string = text
+    /// The final score is the MORE EXTREME of the two engines. This ensures
+    /// crisis language always dominates even if NLTagger returns something mild.
+    private func computeSentimentDual(for text: String, language: NLLanguage) -> Double {
 
-        var sentimentScores: [Double] = []
-        let range = text.startIndex..<text.endIndex
+        // Run BOTH engines in parallel — always
+        let taggerScore = computeSentimentNLTagger(for: text, language: language)
+        let lexiconScore = computeSentimentLexicon(for: text)
 
-        // Evaluate sentiment at the sentence level for finer granularity
-        tagger.enumerateTags(
-            in: range,
-            unit: .sentence,
-            scheme: .sentimentScore,
-            options: [.omitPunctuation, .omitWhitespace, .omitOther]
-        ) { tag, _ in
-            if let tag, let score = Double(tag.rawValue) {
-                sentimentScores.append(score)
-            }
-            return true // continue enumeration
+        logger.debug("💭 NLTagger score: \(taggerScore) | Lexicon score: \(lexiconScore)")
+
+        // Pick the more extreme (further from zero) signal
+        let finalScore: Double
+        if abs(lexiconScore) > abs(taggerScore) {
+            finalScore = lexiconScore
+            logger.debug("💭 Using lexicon score (more extreme): \(lexiconScore)")
+        } else if abs(taggerScore) > 0.001 {
+            finalScore = taggerScore
+            logger.debug("💭 Using NLTagger score (more extreme): \(taggerScore)")
+        } else {
+            finalScore = lexiconScore // lexicon returning 0.0 means genuinely neutral
+            logger.debug("💭 Both engines ≈ 0.0 — genuinely neutral")
         }
 
-        // If no sentence-level scores, try paragraph-level as fallback
-        if sentimentScores.isEmpty {
+        return finalScore
+    }
+
+    /// NLTagger-based sentiment. Tries paragraph → sentence → document (last resort).
+    private func computeSentimentNLTagger(for text: String, language: NLLanguage) -> Double {
+        let tagger = NLTagger(tagSchemes: [.sentimentScore])
+        tagger.string = text
+        let range = text.startIndex..<text.endIndex
+        tagger.setLanguage(language, range: range)
+
+        // Try paragraph and sentence first
+        let primaryUnits: [NLTokenUnit] = [.paragraph, .sentence]
+
+        for unit in primaryUnits {
+            var scores: [Double] = []
             tagger.enumerateTags(
                 in: range,
-                unit: .paragraph,
+                unit: unit,
                 scheme: .sentimentScore,
-                options: [.omitPunctuation, .omitWhitespace, .omitOther]
+                options: [.omitWhitespace, .omitOther]
             ) { tag, _ in
                 if let tag, let score = Double(tag.rawValue) {
-                    sentimentScores.append(score)
+                    scores.append(score)
                 }
                 return true
             }
+
+            let meaningful = scores.filter { abs($0) > 0.001 }
+            if !meaningful.isEmpty {
+                let avg = meaningful.reduce(0.0, +) / Double(meaningful.count)
+                return max(-1.0, min(1.0, avg))
+            }
         }
 
-        // Average all collected scores; default to 0.0 (neutral) if none found
-        guard !sentimentScores.isEmpty else {
-            logger.debug("⚠️ No sentiment scores extracted — defaulting to neutral (0.0)")
-            return 0.0
+        // Document-level fallback — only if paragraph/sentence returned 0.0
+        var docScores: [Double] = []
+        tagger.enumerateTags(
+            in: range,
+            unit: .document,
+            scheme: .sentimentScore,
+            options: [.omitWhitespace, .omitOther]
+        ) { tag, _ in
+            if let tag, let score = Double(tag.rawValue) {
+                docScores.append(score)
+            }
+            return true
         }
 
-        let averageScore = sentimentScores.reduce(0.0, +) / Double(sentimentScores.count)
+        let meaningful = docScores.filter { abs($0) > 0.001 }
+        if !meaningful.isEmpty {
+            let avg = meaningful.reduce(0.0, +) / Double(meaningful.count)
+            return max(-1.0, min(1.0, avg))
+        }
 
-        // Clamp to [-1.0, 1.0] for safety
-        return max(-1.0, min(1.0, averageScore))
+        return 0.0
+    }
+
+    /// Clinical lexicon-based sentiment with three key innovations:
+    ///
+    /// 1. **Crisis Floor:** If ANY crisis phrase is detected, the final score
+    ///    snaps to the most extreme crisis weight. Neutral filler words cannot
+    ///    dilute a -1.0 crisis signal down to -0.66.
+    ///
+    /// 2. **Look-Back Intensifiers:** If a word is preceded by an intensifier
+    ///    ("really", "very", "extremely"), its weight is boosted by 50%.
+    ///    "I am really sad" → sad(-0.4) × 1.5 = -0.6 instead of -0.4.
+    ///
+    /// 3. **Look-Back Negation:** If a word is preceded by a negation
+    ///    ("not", "never", "wasnt"), its polarity is inverted.
+    ///    "I am not sad" → sad(-0.4) × -1.0 = +0.4.
+    private func computeSentimentLexicon(for text: String) -> Double {
+        let lowered = text.lowercased()
+
+        // ── Phase 1: Crisis Phrase Scan ──
+        // These override everything. If present, the score snaps to the floor.
+        var crisisFloor: Double? = nil
+
+        let crisisPhrases: [(phrase: String, weight: Double)] = [
+            ("kill myself", -1.0), ("kill himself", -1.0), ("kill herself", -1.0),
+            ("want to die", -1.0), ("wanna die", -1.0), ("dont want to live", -1.0),
+            ("end my life", -1.0), ("end it all", -1.0),
+            ("suicidal thoughts", -1.0), ("suicidal ideation", -1.0),
+            ("hurt myself", -0.9), ("hurt himself", -0.9), ("hurt herself", -0.9),
+            ("self harm", -0.95), ("self injury", -0.95),
+            ("panic attack", -0.7), ("anxiety attack", -0.7),
+            ("depressive episode", -0.8),
+        ]
+
+        for crisis in crisisPhrases {
+            if lowered.contains(crisis.phrase) {
+                logger.debug("🚨 CRISIS FLOOR ACTIVATED: \"\(crisis.phrase)\" → \(crisis.weight)")
+                // Track the MOST extreme crisis phrase
+                if let existing = crisisFloor {
+                    crisisFloor = min(existing, crisis.weight)
+                } else {
+                    crisisFloor = crisis.weight
+                }
+            }
+        }
+
+        // If a crisis phrase was found, SNAP to the floor — do not average
+        if let floor = crisisFloor {
+            logger.debug("🚨 Crisis floor applied: \(floor)")
+            return floor
+        }
+
+        // ── Phase 2: Tokenize with Look-Back Window ──
+        // Split on non-alphanumeric boundaries, preserving order for look-back
+        let tokens = lowered.components(separatedBy: .alphanumerics.inverted).filter { !$0.isEmpty }
+
+        var accumulatedWeight: Double = 0.0
+        var matchCount: Int = 0
+
+        for i in 0..<tokens.count {
+            let word = tokens[i]
+
+            guard let baseWeight = sentimentLexicon[word] else { continue }
+
+            var adjustedWeight = baseWeight
+
+            // Look back at the previous token
+            if i > 0 {
+                let previous = tokens[i - 1]
+
+                if negations.contains(previous) {
+                    // Negation: invert polarity
+                    // "not sad" → sad(-0.4) becomes +0.4
+                    adjustedWeight = -adjustedWeight
+                    logger.debug("🔄 Negation: \"\(previous) \(word)\" → \(adjustedWeight)")
+                } else if intensifiers.contains(previous) {
+                    // Intensifier: boost magnitude by 50%
+                    // "really sad" → sad(-0.4) × 1.5 = -0.6
+                    adjustedWeight *= 1.5
+                    logger.debug("⬆️ Intensifier: \"\(previous) \(word)\" → \(adjustedWeight)")
+                }
+            }
+
+            // Clamp individual adjusted weights to [-1.0, 1.0]
+            adjustedWeight = max(-1.0, min(1.0, adjustedWeight))
+
+            accumulatedWeight += adjustedWeight
+            matchCount += 1
+        }
+
+        guard matchCount > 0 else { return 0.0 }
+
+        // Weighted average, clamped
+        let average = accumulatedWeight / Double(matchCount)
+        return max(-1.0, min(1.0, average))
     }
 
     // MARK: - Private: Vector Embedding
 
-    /// Generates a dense vector embedding for the transcript using `NLEmbedding`.
-    ///
-    /// Uses `NLEmbedding.sentenceEmbedding(for:)` to produce a high-dimensional
-    /// vector representation of the full transcript. This vector enables semantic
-    /// similarity search between journal entries via cosine similarity.
-    ///
-    /// If the sentence embedding model is unavailable for the detected language,
-    /// falls back to a word-level averaging strategy: each word is embedded
-    /// individually via `NLEmbedding.wordEmbedding(for:)`, and the resulting
-    /// vectors are averaged element-wise. This fallback ensures the pipeline
-    /// never returns an empty vector for valid input.
-    ///
-    /// - Parameters:
-    ///   - text: The transcript text to embed.
-    ///   - language: The detected language for model selection.
-    /// - Returns: A dense `[Double]` array representing the semantic meaning.
-    /// - Throws: `IntelligenceError.embeddingModelUnavailable` if neither sentence
-    ///   nor word embedding models are available for the language.
-    private func generateEmbedding(for text: String, language: NLLanguage) throws -> [Double] {
+    /// Generates a dense vector embedding. Falls back through three tiers:
+    /// sentence embedding → word-level average → zero-vector. Never throws.
+    private func generateEmbedding(for text: String, language: NLLanguage) -> [Double] {
+        let fallbackDimension = 512
 
-        // Attempt 1: Sentence-level embedding (preferred — captures full context)
+        // Attempt 1: Sentence-level embedding
         if let sentenceEmbedding = NLEmbedding.sentenceEmbedding(for: language) {
             if let vector = sentenceEmbedding.vector(for: text) {
                 logger.debug("📐 Sentence embedding succeeded — \(vector.count) dimensions")
                 return vector
             }
-            // Model loaded but couldn't embed this specific text; try fallback
-            logger.debug("⚠️ Sentence embedding model loaded but returned nil for input — trying word fallback")
+            logger.debug("⚠️ Sentence embedding nil for this input — trying word fallback")
         } else {
-            logger.debug("⚠️ Sentence embedding model unavailable for \(language.rawValue) — trying word fallback")
+            logger.debug("⚠️ Sentence embedding model unavailable for \(language.rawValue)")
         }
 
-        // Attempt 2: Word-level embedding fallback (average of word vectors)
+        // Attempt 2: Word-level embedding fallback
         if let wordEmbedding = NLEmbedding.wordEmbedding(for: language) {
             let vector = computeAveragedWordEmbedding(text: text, embedding: wordEmbedding)
             if !vector.isEmpty {
@@ -340,25 +664,14 @@ final class IntelligenceService: IntelligenceServiceProtocol, @unchecked Sendabl
             }
         }
 
-        // Both models failed — this is a fatal error for the pipeline
-        logger.error("❌ No embedding model available for language: \(language.rawValue)")
-        throw IntelligenceError.embeddingModelUnavailable(language: language.rawValue)
+        // Attempt 3: Zero-vector fallback — never crash the pipeline
+        logger.warning("⚠️ All embedding models failed — returning zero-vector (\(fallbackDimension)D)")
+        return [Double](repeating: 0.0, count: fallbackDimension)
     }
 
     // MARK: - Private: Word Embedding Fallback
 
-    /// Computes an averaged word embedding as a fallback when sentence embedding
-    /// is unavailable.
-    ///
-    /// Tokenizes the text into words using `NLTokenizer`, retrieves the embedding
-    /// vector for each word, and returns the element-wise average across all
-    /// successfully embedded words.
-    ///
-    /// - Parameters:
-    ///   - text: The input text to tokenize and embed.
-    ///   - embedding: The `NLEmbedding` word model to use.
-    /// - Returns: The averaged embedding vector, or an empty array if no words
-    ///   could be embedded.
+    /// Computes an averaged word embedding when sentence embedding is unavailable.
     private func computeAveragedWordEmbedding(text: String, embedding: NLEmbedding) -> [Double] {
         let tokenizer = NLTokenizer(unit: .word)
         tokenizer.string = text
@@ -375,14 +688,13 @@ final class IntelligenceService: IntelligenceServiceProtocol, @unchecked Sendabl
                 }
                 wordCount += 1
             }
-            return true // continue enumeration
+            return true
         }
 
         guard wordCount > 0 else {
             return []
         }
 
-        // Normalize by word count to produce the average
         return sumVector.map { $0 / Double(wordCount) }
     }
 }
